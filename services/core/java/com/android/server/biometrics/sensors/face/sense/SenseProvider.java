@@ -454,6 +454,7 @@ public class SenseProvider implements ServiceProvider {
 
     private boolean isGeneratedChallengeCacheValid() {
         return mGeneratedChallengeCache != null
+                && mGeneratedChallengeCache.canReuseResult()
                 && sSystemClock.millis() - mGeneratedChallengeCache.getCreatedAt()
                 < GENERATE_CHALLENGE_REUSE_INTERVAL_MILLIS;
     }

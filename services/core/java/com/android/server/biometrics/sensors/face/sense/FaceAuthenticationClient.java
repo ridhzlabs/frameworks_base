@@ -173,7 +173,9 @@ class FaceAuthenticationClient
     public void onAuthenticated(BiometricAuthenticator.Identifier identifier,
             boolean authenticated, ArrayList<Byte> token) {
         super.onAuthenticated(identifier, authenticated, token);
-        vibrateSuccess();
+        if (wasAuthSuccessful()) {
+            vibrateSuccess();
+        }
 
         mState = STATE_STOPPED;
         mUsageStats.addEvent(new UsageStats.AuthenticationEvent(

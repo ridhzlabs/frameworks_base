@@ -62,8 +62,15 @@ public class FaceGenerateChallengeClient extends GenerateChallengeClient<ISenseS
     @Override
     protected void startHalOperation() {
         mChallengeResult = null;
+        final ISenseService daemon = getFreshDaemon();
+        if (daemon == null) {
+            Slog.e(TAG, "generateChallenge: no sense service");
+            mWaiting = null;
+            mCallback.onClientFinished(this, false /* success */);
+            return;
+        }
         try {
-            mChallengeResult = Long.valueOf(getFreshDaemon().generateChallenge(CHALLENGE_TIMEOUT_SEC));
+            mChallengeResult = Long.valueOf(daemon.generateChallenge(CHALLENGE_TIMEOUT_SEC));
             // send the result to the original caller via mCallback and any waiting callers
             // that called reuseResult
             sendChallengeResult(getListener(), mCallback);
@@ -76,6 +83,14 @@ public class FaceGenerateChallengeClient extends GenerateChallengeClient<ISenseS
         } finally {
             mWaiting = null;
         }
+    }
+
+    /**
+     * @return true while the challenge is being generated or after it was generated. False
+     * after a failed attempt, which has no result to share.
+     */
+    public boolean canReuseResult() {
+        return mWaiting != null || mChallengeResult != null;
     }
 
     /** @return An arbitrary time value for caching provided to the constructor. */
