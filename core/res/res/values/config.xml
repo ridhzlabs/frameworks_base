@@ -564,6 +564,13 @@
     <!-- Slow brightness animation ramp rate in brightness units per second-->
     <integer translatable="false" name="config_brightness_ramp_rate_slow">60</integer>
 
+    <!-- Whether the lights HAL reads the unrounded backlight level. The 8-bit colour only
+         has 254 steps, which a slow brightness ramp shows as visible jumps at low
+         brightness. When true, the backlight's HwLightState also carries the level in
+         flashOnMs, 1-65535 for brightness 0.0-1.0 (0 when off); the backlight never
+         flashes, so HALs that don't read it are unaffected. -->
+    <bool name="config_backlightHighPrecision">false</bool>
+
     <!-- Don't name config resources like this.  It should look like config_annoyDianne -->
     <bool name="config_annoy_dianne">true</bool>
 
