@@ -5432,6 +5432,12 @@
     <!-- Handle volume keys directly in Window Manager without passing them to the foreground app -->
     <bool name="config_handleVolumeKeysInWindowManager">false</bool>
 
+    <!-- Whether to pass the voice call volume index to the audio HAL as MediaTek's
+         "volumeStreamType=;volumeDevice=;volumeIndex=" parameters. MediaTek HALs apply call and
+         VoIP gain from their own gain table at that index, which MediaTek's audio policy sends
+         and AOSP's does not. -->
+    <bool name="config_sendVoiceVolumeIndexToHal">false</bool>
+
     <!-- Rely or not on hardcoded aliased streams table within AudioService -->
     <bool name="config_handleVolumeAliasesUsingVolumeGroups">false</bool>
 

@@ -798,6 +798,10 @@ public class AudioService extends IAudioService.Stub
     };
 
     private final boolean mUseFixedVolume;
+    // config_sendVoiceVolumeIndexToHal, and the last device and index sent
+    private final boolean mSendVoiceVolumeIndexToHal;
+    private int mHalVoiceVolumeDevice = -1;
+    private int mHalVoiceVolumeIndex = -1;
     private final boolean mRingerModeAffectsAlarm;
     private final boolean mUseVolumeGroupAliases;
 
@@ -1668,6 +1672,8 @@ public class AudioService extends IAudioService.Stub
 
         mUseFixedVolume = mContext.getResources().getBoolean(
                 com.android.internal.R.bool.config_useFixedVolume);
+        mSendVoiceVolumeIndexToHal = mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_sendVoiceVolumeIndexToHal);
 
         mRingerModeAffectsAlarm = mContext.getResources().getBoolean(
                 com.android.internal.R.bool.config_audio_ringer_mode_affects_alarm_stream);
@@ -8753,6 +8759,24 @@ public class AudioService extends IAudioService.Stub
         }
     }
 
+    /**
+     * Passes the voice call volume to MediaTek audio HALs the way MediaTek's audio policy does:
+     * the HAL applies call and VoIP gain from its gain table at this index, and without it
+     * stays at its default gain whatever the volume (config_sendVoiceVolumeIndexToHal).
+     */
+    @GuardedBy("mVolumeStateLock")
+    private void sendVoiceVolumeIndexToHal(int nativeIndex, int device) {
+        // MediaTek's policy moves the voice call range down by one (1..N to 0..N-1).
+        final int index = Math.max(nativeIndex - 1, 0);
+        if (device == mHalVoiceVolumeDevice && index == mHalVoiceVolumeIndex) {
+            return;
+        }
+        mHalVoiceVolumeDevice = device;
+        mHalVoiceVolumeIndex = index;
+        AudioSystem.setParameters("volumeStreamType=" + AudioSystem.STREAM_VOICE_CALL
+                + ";volumeDevice=" + device + ";volumeIndex=" + index);
+    }
+
     private void onObserveDevicesForAllStreams(int skipStream) {
         synchronized (mSettingsLock) {
             synchronized (mVolumeStateLock) {
@@ -8767,6 +8791,11 @@ public class AudioService extends IAudioService.Stub
                                     "AudioService#onObserveDevicesForAllStreams");
                         }
                     }
+                }
+                final VolumeStreamState voice = mStreamStates.get(AudioSystem.STREAM_VOICE_CALL);
+                if (mSendVoiceVolumeIndexToHal && voice != null) {
+                    voice.applyDeviceVolume_syncVSS(
+                            getDeviceForStream(AudioSystem.STREAM_VOICE_CALL));
                 }
             }
         }
@@ -10305,6 +10334,10 @@ public class AudioService extends IAudioService.Stub
                         + ", muted=" + muted + ", device=" + device + ")");
             }
             mAudioSystem.setStreamVolumeIndexAS(mStreamType, index, muted, device);
+            if (mSendVoiceVolumeIndexToHal && mStreamType == AudioSystem.STREAM_VOICE_CALL
+                    && device == getDeviceForStream(AudioSystem.STREAM_VOICE_CALL)) {
+                sendVoiceVolumeIndexToHal(index, device);
+            }
         }
 
         // must be called while synchronized mVolumeStateLock
