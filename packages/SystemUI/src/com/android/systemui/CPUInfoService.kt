@@ -58,11 +58,19 @@ class CPUInfoService @Inject constructor(
     private var readJob: kotlinx.coroutines.Job? = null
     private var observerRegistered = false
     private var cpuList: List<String> = emptyList()
+    private var cpuPaths: Map<String, CpuPaths> = emptyMap()
     private var cpuTempDivider = 1
     private var cpuTempSensor = ""
     private var cpuDisplayString = ""
 
     private val fileMap = mutableMapOf<String, RandomAccessFile>()
+    private val failedPaths = mutableSetOf<String>()
+
+    private data class CpuPaths(
+        val freq: String,
+        val governor: String?,
+        val policyFreq: String?
+    )
 
     private val layoutParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -95,24 +103,13 @@ class CPUInfoService @Inject constructor(
         configuration = resources.configuration
         layoutParams.y = getTopInset()
 
-        cpuTempDivider = resources.getInteger(R.integer.config_cpuTempDivider)
+        cpuTempDivider = resources.getInteger(R.integer.config_cpuTempDivider).coerceAtLeast(1)
         cpuTempSensor = getString(R.string.config_cpuTempSensor)
         cpuDisplayString = getString(R.string.config_displayCpus)
 
         cpuList = parseCpuList(cpuDisplayString)
-
-        try {
-            fileMap[cpuTempSensor] = RandomAccessFile(cpuTempSensor, "r")
-            cpuList.forEach { cpu ->
-                val freqPath = "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_cur_freq"
-                val govPath = "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
-                fileMap[freqPath] = RandomAccessFile(freqPath, "r")
-                fileMap[govPath] = RandomAccessFile(govPath, "r")
-            }
-        } catch (e: IOException) {
-            Log.e(TAG, "Error preloading CPU sysfs nodes: ${e.message}")
-            stopSelf()
-        }
+        cpuPaths = cpuList.associateWith { resolveCpuPaths(it) }
+        cpuTempSensor = resolveTempSensor(cpuTempSensor)
 
         cpuInfoView = TextView(this).apply {
             setBackgroundColor(ColorUtils.setAlphaComponent(Color.BLACK, BACKGROUND_ALPHA))
@@ -144,59 +141,193 @@ class CPUInfoService @Inject constructor(
         .windowInsets.getInsets(WindowInsets.Type.statusBars()).top
 
     private fun parseCpuList(displayCpus: String): List<String> {
-        return if (displayCpus.isNotBlank()) {
-            displayCpus.split(",").filter { it.toIntOrNull() != null }
-        } else {
-            val path = "/sys/devices/system/cpu/present"
-            val range = try {
-                File(path).bufferedReader().use { it.readLine() }
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to read CPU range: ${e.message}")
-                null
-            } ?: return listOf("0")
+        if (displayCpus.isNotBlank()) {
+            return displayCpus.split(",")
+                .mapNotNull { it.trim().toIntOrNull() }
+                .distinct()
+                .sorted()
+                .map { it.toString() }
+        }
 
-            return when {
-                range.contains("-") -> {
-                    val bounds = range.split("-").mapNotNull { it.toIntOrNull() }
-                    if (bounds.size == 2) (bounds[0]..bounds[1]).map { it.toString() } else listOf("0")
+        val spec = readFirstLine(File("/sys/devices/system/cpu/present"))
+            ?: readFirstLine(File("/sys/devices/system/cpu/possible"))
+        val parsed = spec?.let { parseCpuRanges(it) }.orEmpty()
+        if (parsed.isNotEmpty()) return parsed
+
+        val fromDirs = File("/sys/devices/system/cpu")
+            .listFiles { file -> file.name.matches(Regex("cpu\\d+")) }
+            ?.mapNotNull { it.name.removePrefix("cpu").toIntOrNull() }
+            ?.distinct()
+            ?.sorted()
+            ?.map { it.toString() }
+            .orEmpty()
+        return fromDirs.ifEmpty { listOf("0") }
+    }
+
+    private fun parseCpuRanges(spec: String): List<String> {
+        val cpus = mutableListOf<Int>()
+        spec.trim().split(",").forEach { part ->
+            val bounds = part.trim().split("-")
+            when (bounds.size) {
+                1 -> bounds[0].toIntOrNull()?.let { cpus.add(it) }
+                2 -> {
+                    val first = bounds[0].toIntOrNull()
+                    val last = bounds[1].toIntOrNull()
+                    if (first != null && last != null && first <= last) {
+                        cpus.addAll(first..last)
+                    }
                 }
-                range.contains(",") -> {
-                    range.split(",").filter { it.toIntOrNull() != null }
-                }
-                else -> listOf("0")
             }
+        }
+        return cpus.distinct().sorted().map { it.toString() }
+    }
+
+    private fun resolveCpuPaths(cpu: String): CpuPaths {
+        val perCpuBase = "/sys/devices/system/cpu/cpu$cpu/cpufreq"
+        val perCpuFreq = "$perCpuBase/scaling_cur_freq"
+        val perCpuGovernor = "$perCpuBase/scaling_governor"
+        val policy = findPolicyForCpu(cpu)
+        val policyFreq = policy?.let { "$it/scaling_cur_freq" }
+        val policyGovernor = policy?.let { "$it/scaling_governor" }
+
+        return CpuPaths(
+            freq = if (File(perCpuFreq).exists()) perCpuFreq else (policyFreq ?: perCpuFreq),
+            governor = if (File(perCpuGovernor).exists()) perCpuGovernor else policyGovernor,
+            policyFreq = policyFreq
+        )
+    }
+
+    private fun findPolicyForCpu(cpu: String): String? {
+        val policies = File("/sys/devices/system/cpu/cpufreq")
+            .listFiles { file -> file.isDirectory && file.name.startsWith("policy") }
+            ?: return null
+        policies.sortedBy { it.name.removePrefix("policy").toIntOrNull() ?: Int.MAX_VALUE }
+            .forEach { policy ->
+                val related = readFirstLine(File(policy, "related_cpus"))
+                    ?: readFirstLine(File(policy, "affected_cpus"))
+                    ?: return@forEach
+                if (related.split(Regex("\\s+")).contains(cpu)) {
+                    return policy.absolutePath
+                }
+            }
+        return null
+    }
+
+    private fun resolveTempSensor(configured: String): String {
+        if (configured.isNotBlank() && readFirstLine(File(configured)) != null) {
+            return configured
+        }
+
+        val zones = File("/sys/class/thermal")
+            .listFiles { file -> file.name.startsWith("thermal_zone") }
+            ?.sortedBy { it.name.removePrefix("thermal_zone").toIntOrNull() ?: Int.MAX_VALUE }
+            .orEmpty()
+        val cpuZone = zones.firstOrNull { zone ->
+            val type = readFirstLine(File(zone, "type"))?.lowercase().orEmpty()
+            isCpuThermalZone(type) && readFirstLine(File(zone, "temp")) != null
+        }
+        return cpuZone?.let { File(it, "temp").absolutePath } ?: configured
+    }
+
+    private fun isCpuThermalZone(type: String): Boolean {
+        if (type.isBlank()) return false
+        if (listOf("gpu", "battery", "charger", "pmic", "usb", "display").any { type.contains(it) }) {
+            return false
+        }
+        return listOf("cpu", "soc", "tscpu", "ap", "cluster").any { type.contains(it) }
+    }
+
+    private fun readFirstLine(file: File): String? {
+        return try {
+            file.bufferedReader().use { it.readLine()?.trim() }
+        } catch (e: IOException) {
+            null
+        } catch (e: SecurityException) {
+            null
         }
     }
 
     private fun startReading() {
+        if (!::cpuInfoView.isInitialized) return
         readJob?.cancel()
-        if (cpuInfoView.parent == null) windowManager.addView(cpuInfoView, layoutParams)
+        if (cpuInfoView.parent == null) {
+            try {
+                windowManager.addView(cpuInfoView, layoutParams)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to add CPU info overlay: ${e.message}")
+            }
+        }
         readJob = coroutineScope.launch {
             while (isActive) {
-                val builder = StringBuilder()
-                val temp = readLineFromRandomAccessFile(cpuTempSensor)?.toIntOrNull()?.div(cpuTempDivider) ?: 0
-                builder.append("Temp: ${temp}°C\n")
-
-                cpuList.forEach { cpu ->
-                    val freqPath = "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_cur_freq"
-                    val govPath = "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor"
-                    val freq = readLineFromRandomAccessFile(freqPath)?.toIntOrNull()?.div(1000) ?: 0
-                    val gov = readLineFromRandomAccessFile(govPath) ?: "N/A"
-                    if (freq > 0) {
-                        builder.append("cpu$cpu: $gov ${freq}MHz\n")
-                    } else {
-                        builder.append("cpu$cpu: offline\n")
-                    }
-                }
-
-                val output = builder.toString().trim()
+                val output = buildCpuInfo()
                 handler.post {
-                    cpuInfoView.text = output
-                    cpuInfoView.visibility = View.VISIBLE
+                    if (output.isBlank()) {
+                        cpuInfoView.visibility = View.GONE
+                    } else {
+                        cpuInfoView.text = output
+                        cpuInfoView.visibility = View.VISIBLE
+                    }
                 }
                 delay(MEASURE_INTERVAL_DEFAULT)
             }
         }
+    }
+
+    private fun buildCpuInfo(): String {
+        var hasReading = false
+        val builder = StringBuilder()
+
+        readTemperature()?.let { temperature ->
+            hasReading = true
+            builder.append("Temp: ${temperature}°C\n")
+        }
+
+        cpuList.forEach { cpu ->
+            val paths = cpuPaths[cpu]
+            var freq = paths?.let { readLineFromRandomAccessFile(it.freq)?.toIntOrNull() }
+            val policyFreq = paths?.policyFreq
+            if ((freq == null || freq <= 0) && policyFreq != null && policyFreq != paths?.freq) {
+                freq = readLineFromRandomAccessFile(policyFreq)?.toIntOrNull()
+            }
+
+            if (freq == null) {
+                builder.append("cpu$cpu: --\n")
+                return@forEach
+            }
+            val currentFreq = freq
+            if (currentFreq <= 0) {
+                builder.append("cpu$cpu: offline\n")
+                return@forEach
+            }
+
+            hasReading = true
+            val mhz = currentFreq / 1000
+            val governor = paths?.governor
+                ?.let { readLineFromRandomAccessFile(it) }
+                ?.takeIf { it.isNotBlank() }
+            if (governor != null) {
+                builder.append("cpu$cpu: $governor ${mhz}MHz\n")
+            } else {
+                builder.append("cpu$cpu: ${mhz}MHz\n")
+            }
+        }
+
+        return if (hasReading) builder.toString().trim() else ""
+    }
+
+    private fun readTemperature(): Int? {
+        val raw = readLineFromRandomAccessFile(cpuTempSensor)?.toIntOrNull() ?: return null
+        if (raw <= 0) return null
+        val scaled = if (cpuTempDivider > 1) {
+            raw / cpuTempDivider
+        } else {
+            when {
+                raw > 1000 -> raw / 1000
+                raw > 200 -> raw / 10
+                else -> raw
+            }
+        }
+        return scaled.takeIf { it in 1..150 }
     }
 
     private fun stopReading() {
@@ -206,18 +337,30 @@ class CPUInfoService @Inject constructor(
     }
 
     private fun removeViewIfNeeded() {
-        if (cpuInfoView.parent != null) {
+        if (::cpuInfoView.isInitialized && cpuInfoView.parent != null) {
             windowManager.removeViewImmediate(cpuInfoView)
         }
     }
 
     private fun readLineFromRandomAccessFile(path: String): String? {
-        val file = fileMap[path] ?: return null
+        if (path.isBlank() || path in failedPaths) return null
+        val file = fileMap[path] ?: try {
+            RandomAccessFile(path, "r").also { fileMap[path] = it }
+        } catch (e: IOException) {
+            Log.w(TAG, "Cannot open $path: ${e.message}")
+            failedPaths.add(path)
+            return null
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot open $path: ${e.message}")
+            failedPaths.add(path)
+            return null
+        }
+
         return try {
             file.seek(0L)
-            file.readLine()
+            file.readLine()?.trim()
         } catch (e: IOException) {
-            Log.e(TAG, "Failed to read from $path: ${e.message}")
+            Log.w(TAG, "Failed to read from $path: ${e.message}")
             null
         }
     }
@@ -229,6 +372,7 @@ class CPUInfoService @Inject constructor(
             try { it.close() } catch (_: IOException) {}
         }
         fileMap.clear()
+        failedPaths.clear()
         if (observerRegistered) {
             wakefulnessLifecycle.removeObserver(wakefulnessObserver)
             observerRegistered = false
